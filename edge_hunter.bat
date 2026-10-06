@@ -562,7 +562,8 @@ def simulate_trades(ev, idx, side, tp_mode, tp_val, sl_val, hold_min, dte, delta
     decay = units * 100 * (bs_vec(entry, K, T1, iv, args.rate, call) - fi)
     return dict(pnl=pnl, exit_px=exit_px, ex_min=ex_min, reason=np.where(stop, 1, np.where(take, 2, 0)),
                 strike=K, buy=buy, sell=sell, units=units, hold=ex_min - emin,
-                decay=decay, spread=units * 100 * 2 * hs, fees=units * args.fee)
+                decay=decay, spread=units * 100 * 2 * hs, fees=units * args.fee,
+                dirok=((exit_px - entry) * side > 0).astype(float))     # did the STOCK move our way (before any costs)?
 
 
 def simulate_chunked(ev, idx, side, *a, chunk=20000):
@@ -881,7 +882,7 @@ def stat_vec(ev, c, args, di, S):
     return out
 
 
-def score_stats(M, B, S, years, args, gated=True):
+def score_stats(M, B, S, years, args, gated=True, profit=True):
     """t-statistic of day P&L over the whole selection window. With gated=True a strategy only scores if it
     is positive on every ticker, in >= pos_blocks of the half-years, in the most recent year, and trades enough."""
     nd, s1, s2 = M[:, :B], M[:, B:2 * B], M[:, 2 * B:3 * B]
@@ -890,7 +891,9 @@ def score_stats(M, B, S, years, args, gated=True):
         mean = S1 / ND
         var = np.maximum(S2 / ND - mean ** 2, 1e-12)
         t = mean / np.sqrt(var / ND)
-    ok = (ND >= args.min_trade_frac * years * 252) & (mean > 0)      # aim: a trade (almost) every day
+    ok = ND >= args.min_trade_frac * years * 252                  # aim: a trade (almost) every day
+    if profit:
+        ok &= mean > 0
     if gated:
         ok &= ((s1 > 0) & (nd > 0)).sum(1) >= math.ceil(args.pos_blocks * B)
         ok &= (M[:, 4 * B:4 * B + S] > 0).all(1)
@@ -1147,14 +1150,15 @@ def nn_fold(D, cfg, lo, hi, rng, args, want_model=False):
     tm = np.zeros(len(cdate), int)
     Pm = np.where(D["M"][need], P, -np.inf)
     best[need], tm[need] = Pm.max(1), Pm.argmax(1)
-    bestm, bestt = None, 0.0
+    # Aim: a trade every day. Among confidence margins that give a trade on most days of the held-out slice, pick the best
+    # one even if it loses money there (the gates, not this step, decide whether the result is good enough).
+    bestm, bestt = -9.0, -1e9
     ho_days = max(len(np.unique(cdate[ho])), 1)
-    for mg in (-0.10, -0.05, 0.0, 0.02, 0.04, 0.07, 0.10, 0.15, 0.22, 0.30):
+    for mg in (-9.0, -0.10, -0.05, 0.0, 0.02, 0.04, 0.07, 0.10, 0.15, 0.22, 0.30):
         r = pick_seq(D, best, tm, ho, mg, cfg["maxday"])
-        if len(r) >= 25 and len(np.unique(cdate[r])) / ho_days >= args.min_trade_frac:     # aim: a trade most days
-            p = D["PNL"][r, tm[r]]
-            tt = day_stats(cdate[r], p)["t"]
-            if tt > bestt and p.mean() > 0:
+        if len(r) >= 25 and len(np.unique(cdate[r])) / ho_days >= args.min_trade_frac:
+            tt = day_stats(cdate[r], D["PNL"][r, tm[r]])["t"]
+            if tt > bestt:
                 bestm, bestt = mg, tt
     r = pick_seq(D, best, tm, te, bestm, cfg["maxday"]) if bestm is not None else np.zeros(0, int)
     out = dict(rows=r, tm=tm[r], margin=bestm, ho_t=bestt, n_train=int(tr.sum() // 2))
@@ -1189,7 +1193,7 @@ def nn_candidate(ev, cfg, args, folds, seed, cache=None, want_model=False):
         if not len(r):
             continue
         ei = D["cidx"][r]
-        sims = {n: {} for n in ("pnl", "decay", "spread", "fees")}
+        sims = {n: {} for n in ("pnl", "decay", "spread", "fees", "dirok")}
         pnl_s = np.zeros(len(r))
         for k in np.unique(tm):
             q = np.nonzero(tm == k)[0]
@@ -1208,14 +1212,14 @@ def nn_candidate(ev, cfg, args, folds, seed, cache=None, want_model=False):
         res["sym"].append(np.asarray(ev.sym)[ei])
         res["pnl"].append(cols_["pnl"])
         res["pnl_s"].append(pnl_s)
-        for n in ("decay", "spread", "fees"):
+        for n in ("decay", "spread", "fees", "dirok"):
             res.setdefault(n, []).append(cols_[n])
         res["tm"].append(np.array([TSETS[cfg["tset"]][k] for k in tm]))
         res["fold"].append(np.full(len(r), fi))
         res.setdefault("side", []).append(D["side"][r])
         res.setdefault("emin", []).append(np.asarray(ev.emin)[ei])
         res.setdefault("level", []).append(np.asarray(ev.level)[ei])
-    for k in ("date", "sym", "pnl", "pnl_s", "tm", "fold", "side", "emin", "level", "decay", "spread", "fees"):
+    for k in ("date", "sym", "pnl", "pnl_s", "tm", "fold", "side", "emin", "level", "decay", "spread", "fees", "dirok"):
         res[k] = np.concatenate(res[k]) if res.get(k) else np.zeros(0)
     for k in ("date", "sym", "tm", "fold", "emin", "level"):
         res[k] = res[k].astype(int)
@@ -1302,11 +1306,12 @@ def task_check(spec):
     r = run_cfg(ev, c, args)
     if r is None:
         base, stress = day_stats([], []), day_stats([], [])
-        base.update(decay=0.0, spread=0.0, fees=0.0, curve=[])
+        base.update(decay=0.0, spread=0.0, fees=0.0, dir_win=0.0, curve=[])
     else:
         idx, side, res = r
         base = day_stats(ev.date[idx], res["pnl"])
         base.update(decay=float(res["decay"].sum()), spread=float(res["spread"].sum()), fees=float(res["fees"].sum()),
+                    dir_win=float(res["dirok"].mean() * 100),
                     curve=make_curve(ev.date[idx], res["pnl"]))
         stress = day_stats(ev.date[idx], cfg_sim(ev, c, idx, side, stress_args(args))["pnl"])
     for d in (base, stress):
@@ -1533,10 +1538,12 @@ class Hunt:
             if np.isfinite(sc).any():
                 self.state["null_best"] = max(self.state["null_best"], float(sc[np.isfinite(sc)].max()))
 
-    def rule_reasons(self, score_g, score_r, thr, chk=None):
+    def rule_reasons(self, score_g, score_r, thr, chk=None, total=None):
         """Plain-English reasons a rule strategy did not make it to the sealed test."""
         a, why = self.a, []
-        if score_g == -np.inf:
+        if total is not None and total <= 0:
+            why.append("it lost money (spread and time decay outweigh any edge it has)")
+        elif score_g == -np.inf:
             why.append("it was not consistent enough: it must trade on at least "
                        f"{int(a.min_trade_frac * 100)}% of days, make money on every ticker, in at least "
                        f"{int(a.pos_blocks * 100)}% of half-years and in the latest year")
@@ -1570,9 +1577,9 @@ class Hunt:
             self.state["checked"][h] = chk
             log(f"    checked rule: {short_label(cfg)}\n      near-identical variants still profitable {frac * 100:.0f}% "
                 f"(need {self.a.nbr_frac * 100:.0f}%), at 1.5x costs {money(st['total'], True)} -> {'PASS' if chk['ok'] else 'fail'}")
-        why = self.rule_reasons(score_g, score_r, thr, chk)
+        why = self.rule_reasons(score_g, score_r, thr, chk, base['total'])
         stats = dict(n_days=base["n_days"], n_trades=base["n_trades"], total=base["total"], t=float(score_g if np.isfinite(score_g) else base["t"]),
-                     win=base["win"], decay=base["decay"], spread=base["spread"], fees=base["fees"], stress_total=float(st["total"]))
+                     win=base["win"], dir_win=base["dir_win"], decay=base["decay"], spread=base["spread"], fees=base["fees"], stress_total=float(st["total"]))
         status = "rejected" if why else "ready"
         verdict = ("Rejected: " + "; ".join(why) + ".") if why else "Cleared every internal test - eligible for a sealed-test look."
         curves = [dict(name="Chosen from this period (in-sample: it was picked because it looked good)", kind="sel", pts=base["curve"])]
@@ -1594,8 +1601,9 @@ class Hunt:
         fin = np.isfinite(g)
         self.state["best_rule"] = float(g[fin].max()) if fin.any() else 0.0
         thr = self.rule_thr()
-        lead = int(np.argmax(g)) if fin.any() else int(np.argmax(r))
-        if max(g[lead], r[lead]) > -np.inf:                    # keep a record of every new "best rule so far"
+        r2 = score_stats(self.pool_M, self.B, self.S, self.years, self.a, gated=False, profit=False)
+        lead = int(np.argmax(g)) if fin.any() else (int(np.argmax(r)) if np.isfinite(r).any() else int(np.argmax(r2)))
+        if max(g[lead], r[lead], r2[lead]) > -np.inf:          # keep a record of every new "best rule so far"
             cfg = cfg_from_key(self.pool_keys[lead])
             if str(cfg_hash(cfg)) != self.state["last_best_rule"] and str(cfg_hash(cfg)) not in self.state["rule_attempts"]:
                 self.rule_attempt(cfg, g[lead], r[lead], thr, nbrs=False)
@@ -1655,6 +1663,7 @@ class Hunt:
         ok, tmin, why = self.nn_gate(s, M)
         s.update(cfg=spec["cfg"], seed=spec["seed"], key=str(_stable_nn(spec["cfg"])))
         stats = dict(n_days=s["n_days"], n_trades=s["n_trades"], total=s["total"], t=s["t"], win=s["win"],
+                     dir_win=float(np.mean(res["dirok"]) * 100) if len(res["dirok"]) else 0.0,
                      decay=float(np.sum(res["decay"])), spread=float(np.sum(res["spread"])), fees=float(np.sum(res["fees"])),
                      stress_total=s["stress_total"], pos_blocks=s["pos_blocks"], n_blocks=s["n_blocks"])
         verdict = ("Cleared every internal test - eligible for a sealed-test look." if ok
@@ -1707,12 +1716,12 @@ class Hunt:
             r = run_cfg(ev, cfg, a)
             if r is None:
                 z = np.zeros(0)
-                rec = dict(date=np.zeros(0, int), sym=np.zeros(0, int), pnl=z, pnl_s=z, decay=z, spread=z, fees=z)
+                rec = dict(date=np.zeros(0, int), sym=np.zeros(0, int), pnl=z, pnl_s=z, decay=z, spread=z, fees=z, dirok=z)
             else:
                 idx, side, res = r
                 rec = dict(date=np.asarray(ev.date)[idx], sym=np.asarray(ev.sym)[idx], pnl=res["pnl"],
                            pnl_s=cfg_sim(ev, cfg, idx, side, stress_args(a))["pnl"], decay=res["decay"],
-                           spread=res["spread"], fees=res["fees"])
+                           spread=res["spread"], fees=res["fees"], dirok=res["dirok"])
             label = short_label(cfg)
         else:
             rec = self.call(dict(kind="locknn", cfg=cfg, seed=extra["seed"] + 1, lock_start=self.lock_start))
@@ -1749,6 +1758,7 @@ class Hunt:
                               "statistically strong enough to rule out luck.") if passed else \
                 ("Failed the sealed test: " + "; ".join(why_not) + ". This look used up part of the error budget.")
             att["lock"] = dict(n_days=n, n_trades=ds["n_trades"], total=ds["total"], t=ds["t"], p=p, alpha_k=ak, win=ds["win"],
+                               dir_win=float(np.mean(rec["dirok"]) * 100) if len(rec["dirok"]) else 0.0,
                                stress_total=stress_total, decay=float(np.sum(rec["decay"])), spread=float(np.sum(rec["spread"])),
                                fees=float(np.sum(rec["fees"])), k=k)
             att["curves"] = [c for c in att["curves"] if c["kind"] != "lock"] + [
@@ -2133,7 +2143,7 @@ function drawChart(el, att) {
 function statCards(s, isLock, den) {
   const c = (k, v, n, c2) => '<div class="stat"><div class="k">' + k + '</div><div class="v ' + (c2 || '') + '">' + v + '</div>' + (n ? '<div class="n">' + n + '</div>' : '') + '</div>';
   return '<div class="stats">' + c('Net profit', sg(s.total), isLock ? 'on the sealed months' : 'after all costs', cl(s.total)) +
-    c('Trades', s.n_trades, 'on ' + s.n_days + ' of ' + den + ' days (' + Math.round(100 * s.n_days / Math.max(den, 1)) + '%)') + c('Win rate', num(s.win, 0) + '%', 'trades that made money') +
+    c('Trades', s.n_trades, 'on ' + s.n_days + ' of ' + den + ' days (' + Math.round(100 * s.n_days / Math.max(den, 1)) + '%)') + c('Win rate', num(s.win, 0) + '%', 'trades that made money after costs') + c('Stock moved your way', num(s.dir_win, 0) + '%', 'before costs: about 50% is a coin flip') +
     c('Score', num(s.t, 2), isLock ? 'p-value ' + num(s.p, 4) + ' (needs \u2264 ' + num(s.alpha_k, 4) + ')' : 'higher = harder to be luck') + '</div>';
 }
 
