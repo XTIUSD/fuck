@@ -1,0 +1,11 @@
+# generated / local-only
+hunter_engine.py
+__pycache__/
+py/
+data_cache/
+hunt_cache/
+hunt_state/
+hunt_results/
+selftest_*/
+STOP.txt
+databento_key.txt
