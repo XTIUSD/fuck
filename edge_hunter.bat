@@ -15,6 +15,9 @@ set "SYMBOLS=SPY QQQ"
 set "FIRST_YEAR=2019"
 set "END=2026-10-01"
 
+REM Last time a trade may be entered, in minutes after the 9:30 open (240 = 1:30pm). Later entries lose far more to time decay.
+set "LAST_ENTRY_MIN=240"
+
 REM The neural net is tested year by year from here on: each test year is traded by a net that was
 REM trained ONLY on earlier years. Needs 2+ years of data before it.
 set "FIRST_TEST_YEAR=2022"
@@ -100,7 +103,7 @@ echo ############################################################
 set "CRASHES=0"
 
 :hunt
-"%PY%" -x "%~f0" --symbols "%SYMBOLS%" --first-year %FIRST_YEAR% --end %END% --first-test-year %FIRST_TEST_YEAR% --lockbox-months %LOCKBOX_MONTHS% --alpha %ALPHA% --workers %WORKERS% --mem-gb %MEM_GB% --max-hours %MAX_HOURS% --seed %SEED% --budget %BUDGET% --iv-mult %IV_MULT% --half-spread %HALF_SPREAD% --fee %FEE% --stress %STRESS% --max-cost %MAX_COST% --out hunt_results %*
+"%PY%" -x "%~f0" --symbols "%SYMBOLS%" --first-year %FIRST_YEAR% --end %END% --first-test-year %FIRST_TEST_YEAR% --last-entry-min %LAST_ENTRY_MIN% --lockbox-months %LOCKBOX_MONTHS% --alpha %ALPHA% --workers %WORKERS% --mem-gb %MEM_GB% --max-hours %MAX_HOURS% --seed %SEED% --budget %BUDGET% --iv-mult %IV_MULT% --half-spread %HALF_SPREAD% --fee %FEE% --stress %STRESS% --max-cost %MAX_COST% --out hunt_results %*
 set "RC=%errorlevel%"
 if "%RC%"=="0" goto :found
 if "%RC%"=="3" goto :stopped
@@ -722,7 +725,7 @@ GENES = {
     "fade": [False, True],
     "sides": ["both", "long", "short"],
     "t0": [5, 15, 30, 60, 120, 180],
-    "t1": [30, 60, 120, 180, 240, 300],
+    "t1": [30, 60, 120, 180, 240],          # last entry 13:30 (240 min after the open)
     "trend": ["none", "ema_with", "ema_against", "vwap_with", "vwap_against"],
     "gap": ["any", "with", "against"],
     "mom": ["any", "with", "against"],
@@ -2215,7 +2218,7 @@ function build() {
   h += '<div class="card"><h2>How this works, in plain English</h2>' +
     '<details open><summary>What is it doing?</summary><p>It invents trading strategies for ' + esc(M.symbols.join(' and ')) + ' options and tests them on years of past minute-by-minute prices. Two kinds of searcher run side by side on every CPU core: a <b>rule search</b> (aiming for a trade almost every day; combinations like "buy a call when price bounces off yesterday\u2019s high") and <b>neural networks</b> that learn which setups tend to pay off. It repeats until something passes the sealed test, or you stop it.</p></details>' +
     '<details><summary>What is the sealed test?</summary><p>The newest ' + M.lock_months + ' months of data (' + esc(M.lock_date) + ' onward, ' + M.lock_days + ' trading days) are locked away. The search never sees them. A strategy is only shown them after it clears every other test, and each look uses up part of an error budget, so luck cannot slip through just by trying again and again. If it passes, the result is strong evidence \u2014 not a guarantee.</p></details>' +
-    '<details><summary>How are options and time decay handled?</summary><p>Every trade is held <b>5 to 30 minutes</b> (never overnight) and buys a real-style <b>in-the-money option</b> (about 60\u201380% delta) and sells it later. The option is priced with the Black-Scholes formula when bought and again when sold, using the volatility the stock has recently shown (\u00d7' + M.iv_mult + '). In between, time passes and the option loses value \u2014 <b>time decay (theta)</b> \u2014 which is charged to every trade (same-day options decay fastest). On top of that each trade pays <b>half the bid/ask spread each way ($' + M.half_spread + ')</b> and <b>$' + M.fee + ' per contract in fees</b>. The "Where the money went" table on each attempt shows exactly how much each of these cost. Prices are modelled, not real quotes.</p></details>' +
+    '<details><summary>How are options and time decay handled?</summary><p>Every trade is entered before 1:30pm, held <b>5 to 30 minutes</b> (never overnight) and buys a real-style <b>in-the-money option</b> (about 60\u201380% delta) and sells it later. The option is priced with the Black-Scholes formula when bought and again when sold, using the volatility the stock has recently shown (\u00d7' + M.iv_mult + '). In between, time passes and the option loses value \u2014 <b>time decay (theta)</b> \u2014 which is charged to every trade (same-day options decay fastest). On top of that each trade pays <b>half the bid/ask spread each way ($' + M.half_spread + ')</b> and <b>$' + M.fee + ' per contract in fees</b>. The "Where the money went" table on each attempt shows exactly how much each of these cost. Prices are modelled, not real quotes.</p></details>' +
     '<details><summary>What do "score" and "p-value" mean?</summary><p><b>Score</b> measures how steady the profit is compared with its ups and downs. Around 0 means no better than a coin flip; 2 would be convincing if you only tried one strategy; but since thousands are tried, the bar is higher (see the meters). <b>p-value</b> is the chance of seeing a result this good by pure luck. Smaller is better.</p></details>' +
     '<details><summary>What if it never finds anything?</summary><p>Then there probably is no tradable edge in this data after realistic option costs \u2014 which is the usual outcome. The page keeps showing the best attempts so you can see how close they got. You can stop at any time (Ctrl+C in the black window, or create a file named STOP.txt next to the .bat) and resume later.</p></details>' +
     '<details><summary>Important caveats</summary><ul class="plain"><li>Option prices are modelled, not real fills; real trading is usually worse.</li><li>A pass is evidence about the past ' + M.lock_months + ' months. Markets change \u2014 paper-trade before using real money.</li><li>Same-day SPY/QQQ options did not exist every day before late 2022; older years assume they did.</li></ul></details></div>';
@@ -2378,7 +2381,7 @@ def parse_args(argv=None):
     p.add_argument("--nn-tasks", type=int, default=0)
     p.add_argument("--nulls", type=int, default=2)
     p.add_argument("--seed", type=int, default=7)
-    p.add_argument("--last-entry-min", type=int, default=300)
+    p.add_argument("--last-entry-min", type=int, default=240, help="last entry, minutes after the 9:30 open (240 = 1:30pm)")
     p.add_argument("--min-days-year", type=int, default=50)
     p.add_argument("--min-trade-frac", type=float, default=0.6, help="aim for a trade each day: share of days a strategy must trade on")
     p.add_argument("--pos-blocks", type=float, default=0.6)
