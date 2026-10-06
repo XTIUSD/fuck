@@ -14,3 +14,18 @@ until a strategy is **confirmed on a sealed test period** (the newest 12 months,
   and `edge_hunter.bat --selftest null` (pure noise - it must never confirm anything).
 
 If the data holds no real edge it will run forever. That is by design: only a sealed-test pass ends the hunt.
+
+---
+
+# Halt Hunter
+
+`halt_hunter.bat` - same machinery (neural net + rule search on every core, sealed-test confirmation, dashboard), but for
+**Nasdaq LULD volatility halts**: it buys shares the moment a halt ends (or, as a separate hunt, sells short).
+
+* Halts come from Databento's trading-status feed for all Nasdaq symbols; 1-minute bars are downloaded only for halted
+  stocks and cached in `data_cache`. Needs your key in `databento_key.txt` the first time; stops if the estimated cost
+  goes over `MAX_COST`.
+* Shares, not options: every fill pays slippage (at least `SLIP_BPS`, or a share of that minute's own range) plus per-share fees.
+* `SIDE=long` or `short` at the top of the .bat (or `halt_hunter.bat --side short`). Each side has its own results folder
+  (`halt_results_long`, `halt_results_short`) and its own sealed-test error budget.
+* Stop: Ctrl+C, or create `STOP_HALTS.txt`. Self-test: `halt_hunter.bat --selftest edge` / `--selftest null`.

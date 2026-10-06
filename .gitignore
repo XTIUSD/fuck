@@ -9,3 +9,9 @@ hunt_results/
 selftest_*/
 STOP.txt
 databento_key.txt
+halt_engine.py
+halt_events/
+halt_state/
+halt_results_*/
+halt_selftest_*/
+STOP_HALTS.txt
