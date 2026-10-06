@@ -34,6 +34,8 @@ REM Stop by itself after this many hours (0 = never: keep hunting until an edge 
 set "MAX_HOURS=0"
 set "SEED=7"
 
+REM Every trade is held 5 to 30 minutes and is always sold the same day. The aim is a trade almost every day
+REM (a strategy must trade on at least 60 percent of days to count).
 REM Option costs. Every trade buys an in-the-money option (the search picks its own delta and expiry),
 REM priced with Black-Scholes at entry AND exit, so TIME DECAY is charged on every trade.
 set "BUDGET=450"
@@ -171,7 +173,7 @@ WHY THIS IS NOT JUST "KEEP TRYING UNTIL SOMETHING LOOKS GOOD"
 
 OPTION MODEL (same as strategy_lab.bat): ITM options priced with Black-Scholes at entry and exit,
 IV = prior-20-day realized vol x IV_MULT, half-spread paid each side, plus fees. Fixed dollar budget
-per trade. Exits are checked on 5-minute bars; if stop and target are both touched in one bar the
+per trade. Every trade is held 5 to 30 minutes and is always sold the same day. Exits are checked on 5-minute bars; if stop and target are both touched in one bar the
 stop is assumed to hit first.
 """
 import os
@@ -225,7 +227,7 @@ NORM = NormalDist()
 MIN_DAY = 390
 YEAR_MIN = 252 * MIN_DAY
 NSLOT = 78
-EV_VERSION = 4
+EV_VERSION = 5
 LEVELS = ["PMH", "PML", "PDH", "PDL", "PDC", "ORH", "ORL", "VWAP", "EMA9"]
 LEVEL_TEXT = {
     "PMH": "the pre-market high", "PML": "the pre-market low", "PDH": "yesterday's high",
@@ -719,15 +721,15 @@ GENES = {
     "kind": ["bounce", "break", "either", "impulse"],
     "fade": [False, True],
     "sides": ["both", "long", "short"],
-    "t0": [5, 15, 30, 60],
-    "t1": [30, 60, 90, 120, 150],
+    "t0": [5, 15, 30, 60, 120, 180],
+    "t1": [30, 60, 120, 180, 240, 300],
     "trend": ["none", "ema_with", "ema_against", "vwap_with", "vwap_against"],
     "gap": ["any", "with", "against"],
     "mom": ["any", "with", "against"],
     "volr": [0.0, 1.0, 1.5, 2.5],
-    "tp": ["0.15", "0.25", "0.35", "0.5", "0.75", "1.0", "level"],
-    "sl": [0.0, 0.15, 0.25, 0.35, 0.5, 0.75],
-    "hold": [30, 60, 120, 180, 0],
+    "tp": ["0.05", "0.08", "0.12", "0.18", "0.25", "level"],     # x average daily range; trades last 5-30 minutes
+    "sl": [0.0, 0.05, 0.08, 0.12, 0.18],
+    "hold": [5, 10, 15, 20, 30],                                 # max minutes held (always sold same day)
     "dte": [0, 1, 3],
     "delta": [0.6, 0.7, 0.8],
     "maxday": [1, 2, 3],
@@ -885,7 +887,7 @@ def score_stats(M, B, S, years, args, gated=True):
         mean = S1 / ND
         var = np.maximum(S2 / ND - mean ** 2, 1e-12)
         t = mean / np.sqrt(var / ND)
-    ok = (ND >= args.min_days_year * years) & (mean > 0)
+    ok = (ND >= args.min_trade_frac * years * 252) & (mean > 0)      # aim: a trade (almost) every day
     if gated:
         ok &= ((s1 > 0) & (nd > 0)).sum(1) >= math.ceil(args.pos_blocks * B)
         ok &= (M[:, 4 * B:4 * B + S] > 0).all(1)
@@ -913,17 +915,17 @@ def scramble_events(ev, seed):
 
 
 # ============================ NEURAL NETWORK ================================
-TPL = [
-    dict(name="Quick scalp (TP 0.25, SL 0.25, to close)", tp_mode="atr", tp=0.25, sl=0.25, hold=0),
-    dict(name="Bigger swing (TP 0.5, SL 0.35, to close)", tp_mode="atr", tp=0.5, sl=0.35, hold=0),
-    dict(name="Next level target, no stop", tp_mode="level", tp=None, sl=0.0, hold=0),
-    dict(name="Time exit only (60 min)", tp_mode="none", tp=None, sl=0.0, hold=60),
-    dict(name="Tight scalp (TP 0.15, SL 0.15, 30 min)", tp_mode="atr", tp=0.15, sl=0.15, hold=30),
-    dict(name="Mid (TP 0.35, SL 0.25, 60 min)", tp_mode="atr", tp=0.35, sl=0.25, hold=60),
-    dict(name="Runner (TP 1.0, SL 0.5, to close)", tp_mode="atr", tp=1.0, sl=0.5, hold=0),
+TPL = [      # every exit style holds 5-30 minutes at most
+    dict(name="Scalp (TP 0.12, SL 0.12, 15 min)", tp_mode="atr", tp=0.12, sl=0.12, hold=15),
+    dict(name="Swing (TP 0.20, SL 0.15, 30 min)", tp_mode="atr", tp=0.20, sl=0.15, hold=30),
+    dict(name="Next level target, no stop (30 min)", tp_mode="level", tp=None, sl=0.0, hold=30),
+    dict(name="Time exit only (15 min)", tp_mode="none", tp=None, sl=0.0, hold=15),
+    dict(name="Tight scalp (TP 0.08, SL 0.08, 10 min)", tp_mode="atr", tp=0.08, sl=0.08, hold=10),
+    dict(name="Time exit only (5 min)", tp_mode="none", tp=None, sl=0.0, hold=5),
     dict(name="Time exit only (30 min)", tp_mode="none", tp=None, sl=0.0, hold=30),
-    dict(name="Time exit only (120 min)", tp_mode="none", tp=None, sl=0.0, hold=120),
-    dict(name="Next level target, stop 0.35", tp_mode="level", tp=None, sl=0.35, hold=0),
+    dict(name="Mid (TP 0.15, SL 0.10, 20 min)", tp_mode="atr", tp=0.15, sl=0.10, hold=20),
+    dict(name="Next level target, stop 0.12 (30 min)", tp_mode="level", tp=None, sl=0.12, hold=30),
+    dict(name="Time exit only (10 min)", tp_mode="none", tp=None, sl=0.0, hold=10),
 ]
 TSETS = {0: [0, 1, 2, 3], 1: [0, 1, 2, 3, 4, 5], 2: list(range(10))}
 NN_GENES = {
@@ -1143,9 +1145,10 @@ def nn_fold(D, cfg, lo, hi, rng, args, want_model=False):
     Pm = np.where(D["M"][need], P, -np.inf)
     best[need], tm[need] = Pm.max(1), Pm.argmax(1)
     bestm, bestt = None, 0.0
-    for mg in (0.0, 0.02, 0.04, 0.07, 0.10, 0.15, 0.22, 0.30):
+    ho_days = max(len(np.unique(cdate[ho])), 1)
+    for mg in (-0.10, -0.05, 0.0, 0.02, 0.04, 0.07, 0.10, 0.15, 0.22, 0.30):
         r = pick_seq(D, best, tm, ho, mg, cfg["maxday"])
-        if len(r) >= 25:
+        if len(r) >= 25 and len(np.unique(cdate[r])) / ho_days >= args.min_trade_frac:     # aim: a trade most days
             p = D["PNL"][r, tm[r]]
             tt = day_stats(cdate[r], p)["t"]
             if tt > bestt and p.mean() > 0:
@@ -1531,8 +1534,9 @@ class Hunt:
         """Plain-English reasons a rule strategy did not make it to the sealed test."""
         a, why = self.a, []
         if score_g == -np.inf:
-            why.append("it was not consistent enough: it must make money on every ticker, in at least "
-                       f"{int(a.pos_blocks * 100)}% of half-years and in the latest year, and trade often enough")
+            why.append("it was not consistent enough: it must trade on at least "
+                       f"{int(a.min_trade_frac * 100)}% of days, make money on every ticker, in at least "
+                       f"{int(a.pos_blocks * 100)}% of half-years and in the latest year")
         elif score_g < thr:
             why.append(f"its score ({score_g:.1f}) is not clearly above what pure luck reaches: the same search on scrambled, "
                        f"unpredictable data scored {self.state['null_best']:.1f}, so it needs at least {thr:.1f}")
@@ -1618,13 +1622,15 @@ class Hunt:
     def nn_gate(self, s, M):
         a = self.a
         tmin, why = self.nn_tmin(M), []
-        if s["n_days"] < a.nn_min_days:
-            why.append(f"it only traded {s['n_days']} days on years it never trained on (needs {a.nn_min_days})")
+        need_days = max(a.nn_min_days, int(a.min_trade_frac * self.n_wf_days))
+        if s["n_days"] < need_days:
+            why.append(f"it traded on only {s['n_days']} of {self.n_wf_days} days on years it never trained on "
+                       f"(the aim is a trade almost every day: needs {need_days})")
         elif s["total"] <= 0:
             why.append("it lost money on years it never trained on")
         elif s["t"] < tmin:
             why.append(f"its score ({s['t']:.1f}) is not high enough: after trying {M} networks some look good by luck, so it needs {tmin:.1f}")
-        if s["n_days"] >= a.nn_min_days and s["total"] > 0:
+        if s["n_days"] >= need_days and s["total"] > 0:
             if s["n_blocks"] < 3 or s["pos_blocks"] < math.ceil(0.6 * s["n_blocks"]):
                 why.append("its profit was not consistent across half-years")
             if not s["sym_ok"]:
@@ -1857,7 +1863,8 @@ class Hunt:
             meta=dict(symbols=self.syms, budget=a.budget, alpha=a.alpha, half_spread=a.half_spread, fee=a.fee,
                       stress=a.stress, iv_mult=a.iv_mult, lock_months=a.lockbox_months,
                       lock_start=ls, lock_date=f"{ls // 10000}-{ls // 100 % 100:02d}-{ls % 100:02d}",
-                      sel_days=self.n_sel_days, lock_days=self.n_lock_days),
+                      sel_days=self.n_sel_days, lock_days=self.n_lock_days, wf_days=self.n_wf_days,
+                      min_trade_frac=a.min_trade_frac),
             hunt=dict(rounds=self.round_no, elapsed=time.time() - self.t0, n_rules=st["n_rules"], n_nn=st["n_nn"],
                       best_rule=st["best_rule"], null_best=st["null_best"], rule_thr=self.rule_thr(),
                       best_nn=st["best_nn_t"], nn_thr=self.nn_tmin(M), looks=len(st["ledger"]),
@@ -1908,7 +1915,7 @@ def describe(c, atr_by_sym, bar_min=0.10):
     lines.append("Take profit: " + (f"at +{c['tp']} x the average daily range ({ex})" if c["tp"] != "level"
                                     else "at the next key level in the trade's direction (PM high/low, yesterday's high/low/close, opening range)") + ".")
     lines.append("Stop loss: " + (f"-{c['sl']} x the average daily range ({exs})." if c["sl"] else "none."))
-    lines.append("Time exit: " + (f"sell after {c['hold']} minutes if neither is hit, " if c["hold"] else "") + "and always sell by the close.")
+    lines.append(f"Time exit: sell after {c['hold']} minutes if neither is hit (trades last 5 to 30 minutes and are always closed the same day).")
     lines.append(f"Option: {int(c['delta'] * 100)}-delta in-the-money, {c['dte']} day(s) to expiry "
                  f"({'expires today' if c['dte'] == 0 else 'not same-day'}). "
                  + ("One trade per ticker per day, first signal only." if c["maxday"] == 1 else
@@ -1918,7 +1925,7 @@ def describe(c, atr_by_sym, bar_min=0.10):
 
 def describe_nn(c):
     exits = ", ".join(TPL[i]["name"] for i in TSETS[c["tset"]])
-    return [f"A neural network ({c['h1']} and {c['h2']} hidden units, ensemble of {c['ens']}, weight decay {c['l2']}, "
+    return [f"Holding time 5 to 30 minutes per trade, always sold the same day. A neural network ({c['h1']} and {c['h2']} hidden units, ensemble of {c['ens']}, weight decay {c['l2']}, "
             f"learning rate {c['lr']}, feature set '{c['feat']}').",
             "Every setup the rule search looks at (level touches, breaks, large candles) is scored by the network, as both "
             "a call and a put, under each exit style; it predicts the net return after spread and decay.",
@@ -2023,6 +2030,7 @@ tr.click{cursor:pointer}tr.click:hover td{background:var(--soft)}
 .tw{overflow-x:auto}
 .pos{color:var(--good)}.neg{color:var(--bad)}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.two>*,.grid>*{min-width:0}
 ol.steps,ul.plain{margin:6px 0;padding-left:22px}
 ol.steps li,ul.plain li{margin:5px 0}
 details{border-top:1px solid var(--line);padding:10px 0}
@@ -2119,10 +2127,10 @@ function drawChart(el, att) {
   hit.addEventListener('mouseleave', () => { tip.style.display = 'none'; xh.style.display = 'none'; });
 }
 
-function statCards(s, isLock) {
+function statCards(s, isLock, den) {
   const c = (k, v, n, c2) => '<div class="stat"><div class="k">' + k + '</div><div class="v ' + (c2 || '') + '">' + v + '</div>' + (n ? '<div class="n">' + n + '</div>' : '') + '</div>';
   return '<div class="stats">' + c('Net profit', sg(s.total), isLock ? 'on the sealed months' : 'after all costs', cl(s.total)) +
-    c('Trades', s.n_trades, s.n_days + ' different days') + c('Win rate', num(s.win, 0) + '%', 'trades that made money') +
+    c('Trades', s.n_trades, 'on ' + s.n_days + ' of ' + den + ' days (' + Math.round(100 * s.n_days / Math.max(den, 1)) + '%)') + c('Win rate', num(s.win, 0) + '%', 'trades that made money') +
     c('Score', num(s.t, 2), isLock ? 'p-value ' + num(s.p, 4) + ' (needs \u2264 ' + num(s.alpha_k, 4) + ')' : 'higher = harder to be luck') + '</div>';
 }
 
@@ -2138,12 +2146,13 @@ function renderDetail() {
   h += '<div class="verdict ' + (a.status === 'passed' ? 'good' : (a.status === 'failed_lockbox' ? 'bad' : (a.status === 'ready' ? 'info' : ''))) + '"><b>What happened:</b> ' + esc(a.verdict) + '</div>';
   h += '<div id="chart"></div>';
   h += '<h3>' + (a.lock ? 'Result on the sealed test' : (a.kind === 'rule' ? 'Result on the training period' : 'Result on years it never trained on')) + '</h3>';
-  h += statCards(a.lock || a.stats, !!a.lock);
-  if (a.lock) h += '<h3>Result before the sealed test</h3>' + statCards(a.stats, false);
+  const dn = a.kind === 'nn' ? M.wf_days : M.sel_days;
+  h += statCards(a.lock || a.stats, !!a.lock, a.lock ? M.lock_days : dn);
+  if (a.lock) h += '<h3>Result before the sealed test</h3>' + statCards(a.stats, false, dn);
   h += '<h3>Where the money went (options, with time decay)</h3>' + costTable(a);
   h += '<h3>What this strategy does</h3>';
   if (a.lines) h += '<ol class="steps">' + a.lines.map(l => '<li>' + esc(l) + '</li>').join('') + '</ol>';
-  else h += '<p class="muted">' + esc(a.label) + '</p><p>A neural network scores every setup (as a call and as a put, under several exit styles) and predicts the profit after costs. It only trades when the prediction clears a confidence bar, one position at a time. It is retrained each year using only earlier years.</p>';
+  else h += '<p class="muted">' + esc(a.label) + '</p><p>A neural network scores every setup (as a call and as a put, under several exit styles) and predicts the profit after costs. It only trades when the prediction clears a confidence bar, one position at a time, holding 5 to 30 minutes. It is retrained each year using only earlier years.</p>';
   el.innerHTML = h;
   drawChart($('#chart'), a);
   $('#prev').onclick = () => { if (i > 0) select(lst[i - 1].id); };
@@ -2204,9 +2213,9 @@ function build() {
       D.ledger.map(e => '<tr class="click" data-id="' + (e.attempt || '') + '"><td>' + e.k + '</td><td class="l">' + esc(e.kind === 'nn' ? 'Neural network' : 'Rule') + ': ' + esc(e.label) + '</td><td>' + e.n_days + '</td><td class="' + cl(e.total) + '">' + sg(e.total) + '</td><td>' + num(e.t, 2) + '</td><td>' + num(e.p, 5) + '</td><td>' + num(e.alpha_k, 5) + '</td><td class="' + cl(e.stress_total) + '">' + sg(e.stress_total) + '</td><td><span class="badge ' + (e.passed ? 'bd-passed' : 'bd-failed_lockbox') + '">' + (e.passed ? 'CONFIRMED' : 'failed') + '</span></td></tr>').join('') + '</table></div></div>';
   }
   h += '<div class="card"><h2>How this works, in plain English</h2>' +
-    '<details open><summary>What is it doing?</summary><p>It invents trading strategies for ' + esc(M.symbols.join(' and ')) + ' options and tests them on years of past minute-by-minute prices. Two kinds of searcher run side by side on every CPU core: a <b>rule search</b> (combinations like "buy a call when price bounces off yesterday\u2019s high") and <b>neural networks</b> that learn which setups tend to pay off. It repeats until something passes the sealed test, or you stop it.</p></details>' +
+    '<details open><summary>What is it doing?</summary><p>It invents trading strategies for ' + esc(M.symbols.join(' and ')) + ' options and tests them on years of past minute-by-minute prices. Two kinds of searcher run side by side on every CPU core: a <b>rule search</b> (aiming for a trade almost every day; combinations like "buy a call when price bounces off yesterday\u2019s high") and <b>neural networks</b> that learn which setups tend to pay off. It repeats until something passes the sealed test, or you stop it.</p></details>' +
     '<details><summary>What is the sealed test?</summary><p>The newest ' + M.lock_months + ' months of data (' + esc(M.lock_date) + ' onward, ' + M.lock_days + ' trading days) are locked away. The search never sees them. A strategy is only shown them after it clears every other test, and each look uses up part of an error budget, so luck cannot slip through just by trying again and again. If it passes, the result is strong evidence \u2014 not a guarantee.</p></details>' +
-    '<details><summary>How are options and time decay handled?</summary><p>Every trade buys a real-style <b>in-the-money option</b> (about 60\u201380% delta) and sells it later. The option is priced with the Black-Scholes formula when bought and again when sold, using the volatility the stock has recently shown (\u00d7' + M.iv_mult + '). In between, time passes and the option loses value \u2014 <b>time decay (theta)</b> \u2014 which is charged to every trade (same-day options decay fastest). On top of that each trade pays <b>half the bid/ask spread each way ($' + M.half_spread + ')</b> and <b>$' + M.fee + ' per contract in fees</b>. The "Where the money went" table on each attempt shows exactly how much each of these cost. Prices are modelled, not real quotes.</p></details>' +
+    '<details><summary>How are options and time decay handled?</summary><p>Every trade is held <b>5 to 30 minutes</b> (never overnight) and buys a real-style <b>in-the-money option</b> (about 60\u201380% delta) and sells it later. The option is priced with the Black-Scholes formula when bought and again when sold, using the volatility the stock has recently shown (\u00d7' + M.iv_mult + '). In between, time passes and the option loses value \u2014 <b>time decay (theta)</b> \u2014 which is charged to every trade (same-day options decay fastest). On top of that each trade pays <b>half the bid/ask spread each way ($' + M.half_spread + ')</b> and <b>$' + M.fee + ' per contract in fees</b>. The "Where the money went" table on each attempt shows exactly how much each of these cost. Prices are modelled, not real quotes.</p></details>' +
     '<details><summary>What do "score" and "p-value" mean?</summary><p><b>Score</b> measures how steady the profit is compared with its ups and downs. Around 0 means no better than a coin flip; 2 would be convincing if you only tried one strategy; but since thousands are tried, the bar is higher (see the meters). <b>p-value</b> is the chance of seeing a result this good by pure luck. Smaller is better.</p></details>' +
     '<details><summary>What if it never finds anything?</summary><p>Then there probably is no tradable edge in this data after realistic option costs \u2014 which is the usual outcome. The page keeps showing the best attempts so you can see how close they got. You can stop at any time (Ctrl+C in the black window, or create a file named STOP.txt next to the .bat) and resume later.</p></details>' +
     '<details><summary>Important caveats</summary><ul class="plain"><li>Option prices are modelled, not real fills; real trading is usually worse.</li><li>A pass is evidence about the past ' + M.lock_months + ' months. Markets change \u2014 paper-trade before using real money.</li><li>Same-day SPY/QQQ options did not exist every day before late 2022; older years assume they did.</li></ul></details></div>';
@@ -2369,8 +2378,9 @@ def parse_args(argv=None):
     p.add_argument("--nn-tasks", type=int, default=0)
     p.add_argument("--nulls", type=int, default=2)
     p.add_argument("--seed", type=int, default=7)
-    p.add_argument("--last-entry-min", type=int, default=150)
+    p.add_argument("--last-entry-min", type=int, default=300)
     p.add_argument("--min-days-year", type=int, default=50)
+    p.add_argument("--min-trade-frac", type=float, default=0.6, help="aim for a trade each day: share of days a strategy must trade on")
     p.add_argument("--pos-blocks", type=float, default=0.6)
     p.add_argument("--rule-tmin", type=float, default=3.0)
     p.add_argument("--null-margin", type=float, default=0.4)
@@ -2399,7 +2409,7 @@ def parse_args(argv=None):
     p.add_argument("--fee", type=float, default=1.30)
     p.add_argument("--max-cost", type=float, default=10.0)
     p.add_argument("--selftest", choices=["null", "edge"], default=None)
-    p.add_argument("--selftest-edge", type=float, default=0.25)
+    p.add_argument("--selftest-edge", type=float, default=0.5)
     p.add_argument("--fresh", action="store_true", help="ignore saved hunt state and start over")
     p.add_argument("--out", default="hunt_results")
     return p.parse_args(argv)
@@ -2467,7 +2477,7 @@ def main():
     sig = md5s(EV_VERSION, args.symbols, args.first_year, args.end, args.dataset, args.lockbox_months, args.tol,
                args.min_move, args.bar_min, args.last_entry_min, args.iv_mult, args.iv_floor, args.iv_default, args.rate,
                args.strike_step, args.half_spread, args.fee, args.budget, args.fill_buf, args.stop_slip, args.nulls,
-               args.min_days_year, args.pos_blocks, args.selftest, args.selftest_edge, args.first_test_year)
+               args.min_trade_frac, args.pos_blocks, args.selftest, args.selftest_edge, args.first_test_year)
     log(f"[2/3] Starting {W} worker processes (one per core, below-normal priority so Windows stays usable) ...")
     keep_awake()
     pool = mp.get_context("spawn").Pool(W, initializer=_init_worker, initargs=(str(ev_dir), dict(vars(args))))
