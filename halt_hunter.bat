@@ -38,8 +38,10 @@ REM Stop by itself after this many hours (0 = never: keep hunting until an edge 
 set "MAX_HOURS=0"
 set "SEED=7"
 
-REM Halts come from Databento's status feed for every Nasdaq symbol, then 1-minute bars only for halted stocks.
-REM If the estimated download cost goes over MAX_COST (US dollars) it stops and tells you before spending more.
+REM Halts come from Databento's status feed (regular hours only, which keeps it cheap), then 1-minute bars only for
+REM halted stocks. MAX_COST is the most this run may spend on Databento in TOTAL, in US dollars. It estimates the cost
+REM BEFORE downloading anything and stops without spending if the estimate is over. Data already in data_cache is free.
+REM To just see the estimate:   halt_hunter.bat --estimate
 set "MAX_COST=10"
 
 REM Trades are SHARES (not options), sized to BUDGET dollars. Halted stocks reopen with wide, jumpy prices, so every
@@ -114,6 +116,7 @@ set "RC=%errorlevel%"
 if "%RC%"=="0" goto :found
 if "%RC%"=="3" goto :stopped
 if "%RC%"=="5" goto :crashed
+if "%RC%"=="6" goto :info
 goto :failed
 
 :found
@@ -127,6 +130,13 @@ exit /b 0
 :stopped
 echo.
 echo Hunt stopped. Progress is saved - run this file again to carry on.
+pause
+exit /b 0
+
+:info
+echo.
+echo Estimate only - nothing was downloaded or spent. Edit MAX_COST / FIRST_YEAR at the top of this file if needed,
+echo then run it normally.
 pause
 exit /b 0
 
@@ -244,6 +254,8 @@ def fmt_td(sec):
 
 
 # ================================ DATA ======================================
+import threading
+
 # Databento status feed: LULD pauses are StatusReason.LULD_PAUSE (50) with action HALT (8) or PAUSE (9);
 # the unhalt is the next record with action TRADING (7).
 LULD_REASON, ACT_HALT, ACT_PAUSE, ACT_TRADING = 50, 8, 9, 7
@@ -253,28 +265,61 @@ LEN_PATH = 96            # minutes of 1-minute bars kept after every unhalt
 GRID_PRE = 90            # minutes before the 9:30 open kept for features
 GRID = GRID_PRE + 390 + LEN_PATH + 8
 MIN_PRE_BARS = 6
+EXIT_INFO = 6            # exit code: --estimate only, nothing downloaded
+# The status feed is asked ONLY for 09:33-16:00 New York time. Outside that window Databento sends a state-change record for
+# every one of ~11,000 symbols at 4:00, 9:30 and 16:00 etc, which would cost 100x more and contains no LULD halts.
+STATUS_FROM, STATUS_TO = "09:33", "16:00"
 
 
-def month_ranges(args):
-    end_ts = pd.Timestamp(args.end)
+class CostCap(Exception):
+    pass
+
+
+class Budget:
+    """What this run has spent / will spend on Databento. Cached data is free, so only NEW downloads count."""
+    lock = threading.Lock()
+    spent = 0.0
+
+    @classmethod
+    def charge(cls, amount, cap):
+        with cls.lock:
+            if cls.spent + amount > cap:
+                raise CostCap(f"the next download would take this run to about ${cls.spent + amount:.2f}, over MAX_COST ${cap:.2f}")
+            cls.spent += amount
+
+
+def halt_days(args):
+    """Every weekday in the range (market holidays just return no data)."""
+    start = pd.Timestamp(f"{args.first_year}-01-01")
     floor = DATASET_START.get(args.dataset)
-    t = pd.Timestamp(f"{args.first_year}-01-01")
     if floor is not None:
-        t = max(t, pd.Timestamp(floor))
-    out = []
-    while t < end_ts:
-        n = min(t + pd.offsets.MonthBegin(1), end_ts)
-        out.append((t.strftime("%Y-%m-%d"), n.strftime("%Y-%m-%d")))
-        t = n
-    return out
+        start = max(start, pd.Timestamp(floor))
+    return [d.strftime("%Y-%m-%d") for d in pd.bdate_range(start, pd.Timestamp(args.end) - pd.Timedelta(days=1))]
 
 
-def halts_cache(start, end, dataset):
-    return Path("data_cache") / f"HALTS_{dataset.replace('.', '_')}_{start}_{end}.pkl"
+def status_cache(day, dataset):
+    return Path("data_cache") / "halt_status" / f"{dataset.replace('.', '_')}_{day}.pkl"
 
 
 def bars_cache(day, dataset):
-    return Path("data_cache") / f"HALTBARS_{dataset.replace('.', '_')}_{day}.pkl"
+    return Path("data_cache") / "halt_bars" / f"{dataset.replace('.', '_')}_{day}.pkl"
+
+
+def ny_utc(day, hhmm):
+    return pd.Timestamp(f"{day} {hhmm}", tz=TZ).tz_convert("UTC")
+
+
+def status_params(day, args):
+    return dict(dataset=args.dataset, symbols="ALL_SYMBOLS", schema="status", start=ny_utc(day, STATUS_FROM), end=ny_utc(day, STATUS_TO))
+
+
+def bars_params(day, symbols, args):
+    """Today's bars from 09:00, plus the last minutes of the previous session (for the prior close)."""
+    prev = (pd.Timestamp(day) - pd.offsets.BDay(1)).strftime("%Y-%m-%d")
+    syms = sorted(symbols)
+    a = dict(dataset=args.dataset, symbols=syms, schema="ohlcv-1m", start=ny_utc(day, "09:00"), end=ny_utc(day, "16:00"))
+    b = dict(dataset=args.dataset, symbols=syms, schema="ohlcv-1m", start=ny_utc(prev, "15:55"), end=ny_utc(prev, "16:00"))
+    return a, b
 
 
 def _enum_val(v, names):
@@ -296,11 +341,6 @@ def _col_num(s, names):
     if pd.api.types.is_numeric_dtype(s):
         return pd.to_numeric(s, errors="coerce").astype(float)
     return s.map(lambda v: _enum_val(v, names)).astype(float)
-
-
-class Budget:
-    """Running estimate of what the Databento downloads will cost."""
-    spent = 0.0
 
 
 def extract_halts(df):
@@ -340,39 +380,110 @@ def extract_halts(df):
     return out, diag
 
 
+def _sample(items, k):
+    if len(items) <= k:
+        return list(items)
+    return [items[int(i)] for i in np.linspace(0, len(items) - 1, k).round()]
+
+
+def _by_year(days, per_day):
+    out = {}
+    for d in days:
+        out[d[:4]] = out.get(d[:4], 0.0) + per_day
+    return out
+
+
+def _advice(days, per_day, args, already=0.0):
+    """Which FIRST_YEAR would fit inside MAX_COST."""
+    room = args.max_cost - already
+    for y in sorted({d[:4] for d in days}):
+        n = sum(1 for d in days if d[:4] >= y)
+        if n * per_day <= room:
+            return f"FIRST_YEAR={y} would cost about ${n * per_day:.2f}"
+    return "even the newest year is over MAX_COST"
+
+
+def _fail_budget(msg, days, per_day, args, already=0.0):
+    sys.exit(f"ERROR: {msg}\n       Nothing more was spent. Either raise MAX_COST in the .bat (the most this run may spend, in US dollars),\n"
+             f"       or use a later FIRST_YEAR ({_advice(days, per_day, args, already)}). Run with --estimate to see the cost without downloading.")
+
+
+def _report_estimate(label, days, per_day, args, extra=""):
+    by_year = _by_year(days, per_day)
+    log(f"  Estimated Databento cost for {label} ({len(days):,} new days): ${per_day * len(days):.2f}   "
+        f"[{'  '.join(f'{y}: ${c:.2f}' for y, c in sorted(by_year.items()))}]   MAX_COST is ${args.max_cost:.2f}. {extra}")
+
+
 def load_halts(args):
-    key = os.environ.get("DATABENTO_API_KEY")
-    frames, diag_all, client = [], {}, None
-    for s, e in month_ranges(args):
-        c = halts_cache(s, e, args.dataset)
-        if c.exists():
-            h, dg = pd.read_pickle(c)
-        else:
-            if not key:
-                sys.exit(f"ERROR: {c.name} is not in data_cache and there is no Databento key.\n"
-                         f"       Put your key alone on the first line of databento_key.txt next to this file.")
-            import databento as db
-            client = client or db.Historical(key)
-            params = dict(dataset=args.dataset, symbols="ALL_SYMBOLS", schema="status", start=s, end=e)
-            cost = client.metadata.get_cost(**params)
-            Budget.spent += cost
-            if Budget.spent > args.max_cost:
-                sys.exit(f"ERROR: the halt (status) data would cost about ${Budget.spent:.2f} so far, over MAX_COST "
-                         f"${args.max_cost:.2f}. Raise MAX_COST in the .bat if you accept that, or use a later FIRST_YEAR.")
-            log(f"  [halts] {s} -> {e}: downloading status feed (est. ${cost:.2f}) ...")
-            h, dg = extract_halts(client.timeseries.get_range(**params).to_df())
-            c.parent.mkdir(parents=True, exist_ok=True)
-            pd.to_pickle((h, dg), c)
-        frames.append(h)
-        for k, v in dg.items():
-            diag_all[k] = diag_all.get(k, 0) + v
+    """One cached file per trading day, holding that day's LULD halts. Only missing days are downloaded."""
+    days = halt_days(args)
+    todo = [d for d in days if not status_cache(d, args.dataset).exists()]
+    if todo:
+        key = os.environ.get("DATABENTO_API_KEY")
+        if not key:
+            sys.exit(f"ERROR: {len(todo):,} days of halt data are not in data_cache yet and there is no Databento key.\n"
+                     f"       Put your key alone on the first line of databento_key.txt next to this file.")
+        import databento as db
+        client = db.Historical(key)
+        samples = [client.metadata.get_cost(**status_params(d, args)) for d in _sample(todo, 8)]
+        per_day = float(np.mean(samples))
+        _report_estimate("the halt list (status feed, regular hours only)", todo, per_day, args,
+                         "1-minute bars for the halted stocks are estimated after the halts are known.")
+        if args.estimate:
+            log("  --estimate: nothing was downloaded or spent.")
+            sys.exit(EXIT_INFO)
+        if per_day * len(todo) > args.max_cost:
+            _fail_budget(f"the halt list alone is estimated at ${per_day * len(todo):.2f}, over MAX_COST ${args.max_cost:.2f}.",
+                         todo, per_day, args)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        log(f"  downloading the halt list for {len(todo):,} days (first run only; cached afterwards) ...")
+        errors = []
+
+        def job(day):
+            c = db.Historical(key)
+            p = status_params(day, args)
+            Budget.charge(c.metadata.get_cost(**p), args.max_cost)
+            h, dg = extract_halts(c.timeseries.get_range(**p).to_df())
+            f = status_cache(day, args.dataset)
+            f.parent.mkdir(parents=True, exist_ok=True)
+            pd.to_pickle((h, dg), f)
+
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futs = {ex.submit(job, d): d for d in todo}
+            done = 0
+            try:
+                for fu in as_completed(futs):
+                    try:
+                        fu.result()
+                    except CostCap as e:
+                        ex.shutdown(wait=True, cancel_futures=True)
+                        _fail_budget(str(e), todo, per_day, args)
+                    except Exception as e:                      # e.g. a day outside the feed's coverage
+                        errors.append((futs[fu], f"{type(e).__name__}: {e}"))
+                    done += 1
+                    if done % 100 == 0 or done == len(todo):
+                        log(f"    {done:,} / {len(todo):,} days  (spent about ${Budget.spent:.2f})")
+            except KeyboardInterrupt:
+                ex.shutdown(wait=False, cancel_futures=True)
+                raise
+        if errors and len(errors) > 0.25 * len(todo):
+            sys.exit(f"ERROR: {len(errors)} of {len(todo)} days failed to download. First error ({errors[0][0]}): {errors[0][1]}")
+        for d, msg in errors[:3]:
+            log(f"  (skipped {d}: {msg[:160]})")
+    frames, diag_all = [], {}
+    for d in days:
+        f = status_cache(d, args.dataset)
+        if f.exists():
+            h, dg = pd.read_pickle(f)
+            frames.append(h)
+            for k, v in dg.items():
+                diag_all[k] = diag_all.get(k, 0) + v
     halts = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["sym", "halt_ts", "resume_ts"])
     if halts.empty:
         sys.exit("ERROR: no LULD halts were found in the status feed. Status records with a pause/halt action were: "
                  f"{diag_all or 'none'}.\n       If you see an action/reason pair above that is the LULD pause, tell me the numbers.")
     dur = (halts.resume_ts - halts.halt_ts).dt.total_seconds() / 60.0
-    keep = (dur >= 1) & (dur <= 120)
-    halts = halts[keep].copy()
+    halts = halts[(dur >= 1) & (dur <= 120)].copy()
     mod = halts.halt_ts.dt.hour * 60 + halts.halt_ts.dt.minute
     rmod = halts.resume_ts.dt.hour * 60 + halts.resume_ts.dt.minute
     halts = halts[(mod >= 9 * 60 + 35) & (rmod <= 15 * 60 + 55)].copy()      # regular-hours LULD pauses only
@@ -382,21 +493,17 @@ def load_halts(args):
     return halts.sort_values("halt_ts").reset_index(drop=True)
 
 
-def fetch_day_bars(day, symbols, args):
-    """1-minute bars for the halted symbols of one day (from the previous afternoon, for the prior close)."""
-    import databento as db
-    client = db.Historical(os.environ.get("DATABENTO_API_KEY"))
-    d = pd.Timestamp(day)
-    start = (d - pd.offsets.BDay(1)).replace(hour=15, tzinfo=None).tz_localize(TZ).tz_convert("UTC")
-    end = d.replace(hour=20).tz_localize(TZ).tz_convert("UTC")
-    params = dict(dataset=args.dataset, symbols=sorted(symbols), schema="ohlcv-1m", start=start, end=end)
-    cost = client.metadata.get_cost(**params)
-    Budget.spent += cost
-    if Budget.spent > args.max_cost:
-        sys.exit(f"ERROR: downloads would cost about ${Budget.spent:.2f}, over MAX_COST ${args.max_cost:.2f}.")
-    df = client.timeseries.get_range(**params).to_df()
+def _fetch_bars(client, day, symbols, args):
+    a, b = bars_params(day, symbols, args)
     out = {}
-    if len(df):
+    frames = []
+    for p in (b, a):
+        Budget.charge(client.metadata.get_cost(**p), args.max_cost)
+        df = client.timeseries.get_range(**p).to_df()
+        if len(df):
+            frames.append(df)
+    if frames:
+        df = pd.concat(frames)
         df.index = pd.DatetimeIndex(pd.to_datetime(df.index, utc=True)).tz_convert(TZ)
         for s, g in df.groupby("symbol"):
             out[str(s)] = g[["open", "high", "low", "close", "volume"]].astype(float).sort_index()
@@ -404,28 +511,60 @@ def fetch_day_bars(day, symbols, args):
 
 
 def load_all_bars(halts, args):
-    """Cache of {symbol: bars} per halt day; downloads only what is missing (4 downloads at a time)."""
-    todo = []
-    for day, g in halts.groupby("day"):
-        if not bars_cache(day, args.dataset).exists():
-            todo.append((day, set(g.sym)))
-    if todo:
-        if not os.environ.get("DATABENTO_API_KEY"):
-            sys.exit(f"ERROR: {len(todo)} days of halt bars are missing from data_cache and there is no Databento key.\n"
-                     f"       Put your key alone on the first line of databento_key.txt next to this file.")
-        from concurrent.futures import ThreadPoolExecutor
-        log(f"  downloading 1-minute bars for {len(todo):,} halt days (first run only; cached afterwards) ...")
+    """1-minute bars around the halts of every halt day (cached per day); downloads only what is missing."""
+    todo = [(day, set(g.sym)) for day, g in halts.groupby("day") if not bars_cache(day, args.dataset).exists()]
+    if not todo:
+        return
+    key = os.environ.get("DATABENTO_API_KEY")
+    if not key:
+        sys.exit(f"ERROR: {len(todo)} days of halt bars are missing from data_cache and there is no Databento key.\n"
+                 f"       Put your key alone on the first line of databento_key.txt next to this file.")
+    import databento as db
+    client = db.Historical(key)
+    pick = _sample(todo, 5)
+    costs = [sum(client.metadata.get_cost(**p) for p in bars_params(d, s, args)) for d, s in pick]
+    per_day = float(np.mean(costs))
+    days = [d for d, _ in todo]
+    _report_estimate("the 1-minute bars around the halts", days, per_day, args)
+    if args.estimate:
+        log("  --estimate: nothing was downloaded or spent.")
+        sys.exit(EXIT_INFO)
+    if Budget.spent + per_day * len(todo) > args.max_cost:
+        _fail_budget(f"the halt bars are estimated at ${per_day * len(todo):.2f} more (already spent ${Budget.spent:.2f}), over MAX_COST "
+                     f"${args.max_cost:.2f}.", days, per_day, args, Budget.spent)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    log(f"  downloading 1-minute bars for {len(todo):,} halt days (first run only; cached afterwards) ...")
+    errors = []
 
-        def job(item):
-            day, syms = item
-            bars = fetch_day_bars(day, syms, args)
-            bars_cache(day, args.dataset).parent.mkdir(parents=True, exist_ok=True)
-            pd.to_pickle(bars, bars_cache(day, args.dataset))
-            return day
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            for i, _ in enumerate(ex.map(job, todo), 1):
-                if i % 50 == 0 or i == len(todo):
-                    log(f"    {i:,} / {len(todo):,} days  (est. spend so far ${Budget.spent:.2f})")
+    def job(item):
+        day, syms = item
+        bars = _fetch_bars(db.Historical(key), day, syms, args)
+        f = bars_cache(day, args.dataset)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        pd.to_pickle(bars, f)
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(job, it): it[0] for it in todo}
+        done = 0
+        try:
+            for fu in as_completed(futs):
+                try:
+                    fu.result()
+                except CostCap as e:
+                    ex.shutdown(wait=True, cancel_futures=True)
+                    _fail_budget(str(e), days, per_day, args, Budget.spent)
+                except Exception as e:
+                    errors.append((futs[fu], f"{type(e).__name__}: {e}"))
+                done += 1
+                if done % 100 == 0 or done == len(todo):
+                    log(f"    {done:,} / {len(todo):,} days  (spent about ${Budget.spent:.2f})")
+        except KeyboardInterrupt:
+            ex.shutdown(wait=False, cancel_futures=True)
+            raise
+    if errors and len(errors) > 0.25 * len(todo):
+        sys.exit(f"ERROR: {len(errors)} of {len(todo)} bar downloads failed. First error ({errors[0][0]}): {errors[0][1]}")
+    for d, msg in errors[:3]:
+        log(f"  (skipped {d}: {msg[:160]})")
 
 
 # ============================ EVENT BUILDING ================================
@@ -2237,7 +2376,7 @@ def make_synthetic(args):
     edge = args.selftest_edge if args.selftest == "edge" else 0.0           # % per minute for 10 minutes
     days = pd.bdate_range(f"{args.first_year}-01-01", pd.Timestamp(args.end) - pd.Timedelta(days=1))
     symbols = [f"T{i:03d}" for i in range(300)]
-    by_month = {}
+    by_day = {}
     for day in days:
         d0 = pd.Timestamp(f"{day:%Y-%m-%d} 09:30", tz=TZ)
         prev_ts = (pd.Timestamp(f"{day:%Y-%m-%d} 15:59", tz=TZ) - pd.offsets.BDay(1))
@@ -2267,12 +2406,16 @@ def make_synthetic(args):
             prev = pd.DataFrame(dict(open=[prev_close], high=[prev_close], low=[prev_close], close=[prev_close], volume=[100.0]),
                                 index=pd.DatetimeIndex([prev_ts]))
             bars[s] = pd.concat([prev, df])
-            by_month.setdefault(f"{day:%Y-%m}", []).append((s, d0 + pd.Timedelta(minutes=th), d0 + pd.Timedelta(minutes=th + dur)))
-        pd.to_pickle(bars, bars_cache(f"{day:%Y-%m-%d}", args.dataset))
-    for s_, e_ in month_ranges(args):
-        rows = by_month.get(s_[:7], [])
+            by_day.setdefault(f"{day:%Y-%m-%d}", []).append((s, d0 + pd.Timedelta(minutes=th), d0 + pd.Timedelta(minutes=th + dur)))
+        bf = bars_cache(f"{day:%Y-%m-%d}", args.dataset)
+        bf.parent.mkdir(parents=True, exist_ok=True)
+        pd.to_pickle(bars, bf)
+    for day in days:
+        rows = by_day.get(f"{day:%Y-%m-%d}", [])
         h = pd.DataFrame(rows, columns=["sym", "halt_ts", "resume_ts"])
-        pd.to_pickle((h, {"action=9 reason=50": len(h)}), halts_cache(s_, e_, args.dataset))
+        f = status_cache(f"{day:%Y-%m-%d}", args.dataset)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        pd.to_pickle((h, {"action=9 reason=50": len(h)}), f)
 
 
 def setup_selftest(args):
@@ -2283,7 +2426,7 @@ def setup_selftest(args):
         + ("(continuation after the unhalt is planted - the hunter SHOULD find it)" if args.selftest == "edge"
            else "(pure noise - the hunter must NOT confirm anything)"))
     Path("data_cache").mkdir(exist_ok=True)
-    if not all(halts_cache(a_, b_, args.dataset).exists() for a_, b_ in month_ranges(args)):
+    if not all(status_cache(d_, args.dataset).exists() for d_ in halt_days(args)):
         log("  generating synthetic halts and 1-minute bars ...")
         make_synthetic(args)
 
@@ -2377,7 +2520,8 @@ def parse_args(argv=None):
     p.add_argument("--fee-share", type=float, default=0.004, help="fees, $ per share per side")
     p.add_argument("--min-price", type=float, default=0.5)
     p.add_argument("--max-price", type=float, default=200.0)
-    p.add_argument("--max-cost", type=float, default=10.0)
+    p.add_argument("--max-cost", type=float, default=10.0, help="most this run may spend on Databento, US dollars (cached data is free)")
+    p.add_argument("--estimate", action="store_true", help="only print what the Databento downloads would cost, then exit")
     p.add_argument("--no-browser", action="store_true")
     p.add_argument("--selftest", choices=["null", "edge"], default=None)
     p.add_argument("--selftest-edge", type=float, default=0.2)
