@@ -23,8 +23,10 @@ If the data holds no real edge it will run forever. That is by design: only a se
 **Nasdaq LULD volatility halts**: it buys shares the moment a halt ends (or, as a separate hunt, sells short).
 
 * Halts come from Databento's trading-status feed for all Nasdaq symbols; 1-minute bars are downloaded only for halted
-  stocks and cached in `data_cache`. Needs your key in `databento_key.txt` the first time; stops if the estimated cost
-  goes over `MAX_COST`.
+  stocks and cached in `data_cache`. Needs your key in `databento_key.txt` the first time. The first run downloads once
+  (later runs are free): it prints the estimated cost per year and waits 15 seconds (Ctrl+C to cancel) before starting.
+  `halt_hunter.bat --estimate` only prints the estimate. A later `FIRST_YEAR` / `FIRST_TEST_YEAR` costs less; `MAX_COST`
+  (default 0 = no limit) can be set to refuse any download estimated above it.
 * Shares, not options: every fill pays slippage (at least `SLIP_BPS`, or a share of that minute's own range) plus per-share fees.
 * `SIDE=long` or `short` at the top of the .bat (or `halt_hunter.bat --side short`). Each side has its own results folder
   (`halt_results_long`, `halt_results_short`) and its own sealed-test error budget.

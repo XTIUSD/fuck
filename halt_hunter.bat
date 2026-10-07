@@ -38,11 +38,13 @@ REM Stop by itself after this many hours (0 = never: keep hunting until an edge 
 set "MAX_HOURS=0"
 set "SEED=7"
 
-REM Halts come from Databento's status feed (regular hours only, which keeps it cheap), then 1-minute bars only for
-REM halted stocks. MAX_COST is the most this run may spend on Databento in TOTAL, in US dollars. It estimates the cost
-REM BEFORE downloading anything and stops without spending if the estimate is over. Data already in data_cache is free.
-REM To just see the estimate:   halt_hunter.bat --estimate
-set "MAX_COST=10"
+REM Halts come from Databento's status feed (regular hours only), then 1-minute bars only for halted stocks.
+REM The first run downloads this ONE TIME (it is saved in data_cache, so later runs cost nothing). Before it starts it
+REM prints roughly what that will cost on your Databento account and waits 15 seconds - press Ctrl+C to cancel.
+REM More years of history cost more (about the same per year): a later FIRST_YEAR / FIRST_TEST_YEAR is cheaper.
+REM To only see the estimate:   halt_hunter.bat --estimate
+REM MAX_COST: 0 = no limit. If you put a number here (US dollars) it refuses to start a download estimated above it.
+set "MAX_COST=0"
 
 REM Trades are SHARES (not options), sized to BUDGET dollars. Halted stocks reopen with wide, jumpy prices, so every
 REM fill pays slippage: at least SLIP_BPS (hundredths of a percent of price), or SLIP_RNG x that minute's own
@@ -255,6 +257,7 @@ def fmt_td(sec):
 
 # ================================ DATA ======================================
 import threading
+import time
 
 # Databento status feed: LULD pauses are StatusReason.LULD_PAUSE (50) with action HALT (8) or PAUSE (9);
 # the unhalt is the next record with action TRADING (7).
@@ -283,7 +286,7 @@ class Budget:
     @classmethod
     def charge(cls, amount, cap):
         with cls.lock:
-            if cls.spent + amount > cap:
+            if cap and cls.spent + amount > cap:
                 raise CostCap(f"the next download would take this run to about ${cls.spent + amount:.2f}, over MAX_COST ${cap:.2f}")
             cls.spent += amount
 
@@ -309,16 +312,24 @@ def ny_utc(day, hhmm):
     return pd.Timestamp(f"{day} {hhmm}", tz=TZ).tz_convert("UTC")
 
 
+def _atomic_pickle(obj, path):
+    """Write-then-rename, so a crash or Ctrl+C can never leave a half-written cache file behind."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}_{threading.get_ident()}")
+    pd.to_pickle(obj, tmp)
+    os.replace(tmp, path)
+
+
 def status_params(day, args):
     return dict(dataset=args.dataset, symbols="ALL_SYMBOLS", schema="status", start=ny_utc(day, STATUS_FROM), end=ny_utc(day, STATUS_TO))
 
 
 def bars_params(day, symbols, args):
-    """Today's bars from 09:00, plus the last minutes of the previous session (for the prior close)."""
+    """Today's bars from 09:00, plus the last hour of the previous session (for the prior close)."""
     prev = (pd.Timestamp(day) - pd.offsets.BDay(1)).strftime("%Y-%m-%d")
     syms = sorted(symbols)
     a = dict(dataset=args.dataset, symbols=syms, schema="ohlcv-1m", start=ny_utc(day, "09:00"), end=ny_utc(day, "16:00"))
-    b = dict(dataset=args.dataset, symbols=syms, schema="ohlcv-1m", start=ny_utc(prev, "15:55"), end=ny_utc(prev, "16:00"))
+    b = dict(dataset=args.dataset, symbols=syms, schema="ohlcv-1m", start=ny_utc(prev, "15:00"), end=ny_utc(prev, "16:00"))
     return a, b
 
 
@@ -345,6 +356,9 @@ def _col_num(s, names):
 
 def extract_halts(df):
     """From a raw status DataFrame: one row per LULD pause -> (symbol, halt time, unhalt time)."""
+    if df is None or len(df) == 0:
+        empty = pd.to_datetime(pd.Series([], dtype="object"), utc=True).dt.tz_convert(TZ)
+        return pd.DataFrame({"sym": pd.Series([], dtype=str), "halt_ts": empty, "resume_ts": empty}), {}
     d = df.reset_index()
     tcol = "ts_event" if "ts_event" in d.columns else d.columns[0]
     ts = pd.to_datetime(d[tcol], utc=True)
@@ -366,9 +380,15 @@ def extract_halts(df):
         i, n = 0, len(g)
         while i < n:
             if st[i]:
-                j = i + 1
+                j, orphan = i + 1, False
                 while j < n and not rs[j]:          # extended pause: further LULD records before the unhalt
+                    if st[j] and ts_[j] - ts_[i] > np.timedelta64(20, "m"):
+                        orphan = True               # 20+ minutes later: the first record never resumed; start over here
+                        break
                     j += 1
+                if orphan:
+                    i = j
+                    continue
                 if j < n:
                     rows.append((s, ts_[i], ts_[j]))
                 i = j + 1
@@ -386,32 +406,67 @@ def _sample(items, k):
     return [items[int(i)] for i in np.linspace(0, len(items) - 1, k).round()]
 
 
-def _by_year(days, per_day):
-    out = {}
-    for d in days:
-        out[d[:4]] = out.get(d[:4], 0.0) + per_day
-    return out
+def _lock_year(args):
+    return (pd.Timestamp(args.end) - pd.DateOffset(months=args.lockbox_months)).year
 
 
-def _advice(days, per_day, args, already=0.0):
-    """Which FIRST_YEAR would fit inside MAX_COST."""
+def _yearly(items, cost_fn):
+    """{year: (number of new days, estimated cost per day)} from up to 3 evenly spaced sample days of EACH year,
+    because the data volume (and so the price) differs a lot from year to year."""
+    by = {}
+    for d in items:
+        by.setdefault(d[:4], []).append(d)
+    return {y: (len(ds), float(np.mean([cost_fn(d) for d in _sample(ds, 3)]))) for y, ds in by.items()}
+
+
+def _total(yearly):
+    return sum(n * c for n, c in yearly.values())
+
+
+def _from_year(yearly, y):
+    return sum(n * c for yy, (n, c) in yearly.items() if yy >= y)
+
+
+def _advice(yearly, args, already=0.0):
+    """The earliest FIRST_YEAR that fits inside MAX_COST and still leaves the neural net a year to learn from."""
     room = args.max_cost - already
-    for y in sorted({d[:4] for d in days}):
-        n = sum(1 for d in days if d[:4] >= y)
-        if n * per_day <= room:
-            return f"FIRST_YEAR={y} would cost about ${n * per_day:.2f}"
-    return "even the newest year is over MAX_COST"
+    for y in sorted(yearly):
+        fty = max(args.first_test_year, int(y) + 1)
+        if _from_year(yearly, y) <= room and fty <= _lock_year(args):
+            return f"FIRST_YEAR={y} with FIRST_TEST_YEAR={fty} would cost about ${_from_year(yearly, y):.2f}"
+    return "no start year fits inside MAX_COST"
 
 
-def _fail_budget(msg, days, per_day, args, already=0.0):
-    sys.exit(f"ERROR: {msg}\n       Nothing more was spent. Either raise MAX_COST in the .bat (the most this run may spend, in US dollars),\n"
-             f"       or use a later FIRST_YEAR ({_advice(days, per_day, args, already)}). Run with --estimate to see the cost without downloading.")
+def _grace(est, what, args, seconds=15):
+    """No hard stop: say plainly what this will cost and give a few seconds to cancel (Ctrl+C) before it starts."""
+    if est < 1.0 or args.yes:
+        return
+    log(f"\n  NOTE: downloading {what} will cost about ${est:.2f} on your Databento account. One time only: it is saved in")
+    log(f"  data_cache afterwards, so later runs cost nothing. Press Ctrl+C within {seconds} seconds to cancel; otherwise it starts.")
+    log("  (A cheaper run: set a later FIRST_YEAR / FIRST_TEST_YEAR at the top of the .bat. To skip this pause: add --yes.)")
+    for _ in range(seconds):
+        time.sleep(1)
+    log("  starting ...")
 
 
-def _report_estimate(label, days, per_day, args, extra=""):
-    by_year = _by_year(days, per_day)
-    log(f"  Estimated Databento cost for {label} ({len(days):,} new days): ${per_day * len(days):.2f}   "
-        f"[{'  '.join(f'{y}: ${c:.2f}' for y, c in sorted(by_year.items()))}]   MAX_COST is ${args.max_cost:.2f}. {extra}")
+def _fail_budget(msg, yearly, args, already=0.0):
+    sys.exit(f"ERROR: {msg}\n       Nothing more was spent. Either raise MAX_COST in the .bat (or set it to 0 for no limit),\n"
+             f"       or use a later start year: {_advice(yearly, args, already)}. Run with --estimate to see the cost without downloading.")
+
+
+def _report_estimate(label, yearly, args, extra=""):
+    n = sum(v[0] for v in yearly.values())
+    limit = f"MAX_COST is ${args.max_cost:.2f}" if args.max_cost else "no spending limit set"
+    log(f"  Estimated Databento cost for {label} ({n:,} new days): ${_total(yearly):.2f}   ({limit}). {extra}")
+    log("    by year: " + "   ".join(f"{y}: ${c * k:.2f}" for y, (k, c) in sorted(yearly.items())))
+    if len(yearly) > 1 and _total(yearly) >= 1.0:
+        opts = []
+        for y in sorted(yearly)[1:]:
+            fty = max(args.first_test_year, int(y) + 1)
+            if fty <= _lock_year(args):
+                opts.append(f"FIRST_YEAR={y} (FIRST_TEST_YEAR={fty}): ${_from_year(yearly, y):.2f}")
+        if opts:
+            log("    cheaper starts: " + "   ".join(opts))
 
 
 def load_halts(args):
@@ -425,16 +480,15 @@ def load_halts(args):
                      f"       Put your key alone on the first line of databento_key.txt next to this file.")
         import databento as db
         client = db.Historical(key)
-        samples = [client.metadata.get_cost(**status_params(d, args)) for d in _sample(todo, 8)]
-        per_day = float(np.mean(samples))
-        _report_estimate("the halt list (status feed, regular hours only)", todo, per_day, args,
+        yearly = _yearly(todo, lambda d: client.metadata.get_cost(**status_params(d, args)))
+        _report_estimate("the halt list (status feed, regular hours only)", yearly, args,
                          "1-minute bars for the halted stocks are estimated after the halts are known.")
         if args.estimate:
             log("  --estimate: nothing was downloaded or spent.")
             sys.exit(EXIT_INFO)
-        if per_day * len(todo) > args.max_cost:
-            _fail_budget(f"the halt list alone is estimated at ${per_day * len(todo):.2f}, over MAX_COST ${args.max_cost:.2f}.",
-                         todo, per_day, args)
+        if args.max_cost and _total(yearly) > args.max_cost:
+            _fail_budget(f"the halt list alone is estimated at ${_total(yearly):.2f}, over MAX_COST ${args.max_cost:.2f}.", yearly, args)
+        _grace(_total(yearly), "the halt list", args)
         from concurrent.futures import ThreadPoolExecutor, as_completed
         log(f"  downloading the halt list for {len(todo):,} days (first run only; cached afterwards) ...")
         errors = []
@@ -443,21 +497,35 @@ def load_halts(args):
             c = db.Historical(key)
             p = status_params(day, args)
             Budget.charge(c.metadata.get_cost(**p), args.max_cost)
-            h, dg = extract_halts(c.timeseries.get_range(**p).to_df())
-            f = status_cache(day, args.dataset)
-            f.parent.mkdir(parents=True, exist_ok=True)
-            pd.to_pickle((h, dg), f)
+            df = c.timeseries.get_range(**p).to_df()
+            try:
+                h, dg = extract_halts(df)
+            except Exception:
+                _atomic_pickle(df, Path("data_cache") / "halt_status_failed" / f"{day}.pkl")   # keep what was paid for
+                raise
+            _atomic_pickle((h, dg), status_cache(day, args.dataset))
 
+        # the first few days run one at a time: if something is systematically wrong, find out after 3 downloads, not 1,500
+        canary = todo[:3]
+        for day in canary:
+            try:
+                job(day)
+            except CostCap as e:
+                _fail_budget(str(e), yearly, args)
+            except Exception as e:
+                sys.exit(f"ERROR: the first test download ({day}) failed: {type(e).__name__}: {e}\n"
+                         f"       Stopped after spending very little. If this keeps happening, tell me this message.")
+        rest = todo[3:]
         with ThreadPoolExecutor(max_workers=4) as ex:
-            futs = {ex.submit(job, d): d for d in todo}
-            done = 0
+            futs = {ex.submit(job, d): d for d in rest}
+            done = len(canary)
             try:
                 for fu in as_completed(futs):
                     try:
                         fu.result()
                     except CostCap as e:
                         ex.shutdown(wait=True, cancel_futures=True)
-                        _fail_budget(str(e), todo, per_day, args)
+                        _fail_budget(str(e), yearly, args)
                     except Exception as e:                      # e.g. a day outside the feed's coverage
                         errors.append((futs[fu], f"{type(e).__name__}: {e}"))
                     done += 1
@@ -468,14 +536,16 @@ def load_halts(args):
                 raise
         if errors and len(errors) > 0.25 * len(todo):
             sys.exit(f"ERROR: {len(errors)} of {len(todo)} days failed to download. First error ({errors[0][0]}): {errors[0][1]}")
-        for d, msg in errors[:3]:
-            log(f"  (skipped {d}: {msg[:160]})")
+        if errors:
+            log(f"  {len(errors)} day(s) could not be downloaded and are skipped this time (they are retried automatically "
+                f"the next time you run this). First: {errors[0][0]}: {errors[0][1][:140]}")
     frames, diag_all = [], {}
     for d in days:
         f = status_cache(d, args.dataset)
         if f.exists():
             h, dg = pd.read_pickle(f)
-            frames.append(h)
+            if len(h):
+                frames.append(h)
             for k, v in dg.items():
                 diag_all[k] = diag_all.get(k, 0) + v
     halts = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["sym", "halt_ts", "resume_ts"])
@@ -521,27 +591,25 @@ def load_all_bars(halts, args):
                  f"       Put your key alone on the first line of databento_key.txt next to this file.")
     import databento as db
     client = db.Historical(key)
-    pick = _sample(todo, 5)
-    costs = [sum(client.metadata.get_cost(**p) for p in bars_params(d, s, args)) for d, s in pick]
-    per_day = float(np.mean(costs))
+    syms_of = dict(todo)
     days = [d for d, _ in todo]
-    _report_estimate("the 1-minute bars around the halts", days, per_day, args)
+    yearly = _yearly(days, lambda d: sum(client.metadata.get_cost(**p) for p in bars_params(d, syms_of[d], args)))
+    per_day = _total(yearly) / max(len(todo), 1)
+    _report_estimate("the 1-minute bars around the halts", yearly, args)
     if args.estimate:
         log("  --estimate: nothing was downloaded or spent.")
         sys.exit(EXIT_INFO)
-    if Budget.spent + per_day * len(todo) > args.max_cost:
-        _fail_budget(f"the halt bars are estimated at ${per_day * len(todo):.2f} more (already spent ${Budget.spent:.2f}), over MAX_COST "
-                     f"${args.max_cost:.2f}.", days, per_day, args, Budget.spent)
+    if args.max_cost and Budget.spent + _total(yearly) > args.max_cost:
+        _fail_budget(f"the halt bars are estimated at ${_total(yearly):.2f} more (already spent ${Budget.spent:.2f}), over MAX_COST "
+                     f"${args.max_cost:.2f}.", yearly, args, Budget.spent)
+    _grace(_total(yearly), "the 1-minute bars around the halts", args)
     from concurrent.futures import ThreadPoolExecutor, as_completed
     log(f"  downloading 1-minute bars for {len(todo):,} halt days (first run only; cached afterwards) ...")
     errors = []
 
     def job(item):
         day, syms = item
-        bars = _fetch_bars(db.Historical(key), day, syms, args)
-        f = bars_cache(day, args.dataset)
-        f.parent.mkdir(parents=True, exist_ok=True)
-        pd.to_pickle(bars, f)
+        _atomic_pickle(_fetch_bars(db.Historical(key), day, syms, args), bars_cache(day, args.dataset))
 
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = {ex.submit(job, it): it[0] for it in todo}
@@ -552,7 +620,7 @@ def load_all_bars(halts, args):
                     fu.result()
                 except CostCap as e:
                     ex.shutdown(wait=True, cancel_futures=True)
-                    _fail_budget(str(e), days, per_day, args, Budget.spent)
+                    _fail_budget(str(e), yearly, args, Budget.spent)
                 except Exception as e:
                     errors.append((futs[fu], f"{type(e).__name__}: {e}"))
                 done += 1
@@ -563,8 +631,9 @@ def load_all_bars(halts, args):
             raise
     if errors and len(errors) > 0.25 * len(todo):
         sys.exit(f"ERROR: {len(errors)} of {len(todo)} bar downloads failed. First error ({errors[0][0]}): {errors[0][1]}")
-    for d, msg in errors[:3]:
-        log(f"  (skipped {d}: {msg[:160]})")
+    if errors:
+        log(f"  {len(errors)} halt day(s) could not be downloaded and are skipped this time (retried the next run). "
+            f"First: {errors[0][0]}: {errors[0][1][:140]}")
 
 
 # ============================ EVENT BUILDING ================================
@@ -603,18 +672,21 @@ def events_for_symbol_day(b, day, halts, args, tick_id, daykey):
         tr = int((hr.resume_ts - d0).total_seconds() // 60)
         if th < 5 or tr > 385 or tr <= th:
             continue
-        if np.isfinite(c[GRID_PRE:GRID_PRE + th]).sum() < MIN_PRE_BARS:
+        if np.isfinite(c[GRID_PRE - 30:GRID_PRE + th + 1]).sum() < MIN_PRE_BARS:
             continue
-        p = cf[GRID_PRE + th - 1]
+        p = cf[GRID_PRE + th]                      # last price before the halt, including the minute the halt began
         if not (np.isfinite(p) and args.min_price <= p <= args.max_price):
             continue
         at = lambda m: cf[GRID_PRE + m]
-        r5, r15, r30 = p / at(th - 6) - 1, p / at(th - 16) - 1, p / at(th - 31) - 1
+        r5, r15, r30 = p / at(th - 5) - 1, p / at(th - 15) - 1, p / at(th - 30) - 1
         if not all(np.isfinite([r5, r15, r30])):
             continue
-        v5 = float(np.nansum(v[GRID_PRE + th - 5:GRID_PRE + th]))
-        base = float(np.nansum(v[GRID_PRE + th - 65:GRID_PRE + th - 5])) / 12.0
-        hi5, lo5 = h[GRID_PRE + th - 5:GRID_PRE + th], l[GRID_PRE + th - 5:GRID_PRE + th]
+        v5 = float(np.nansum(v[GRID_PRE + th - 4:GRID_PRE + th + 1]))
+        lo_m = max(th - 64, -30)                   # bars are downloaded from 09:00 only; never average over minutes we never asked for
+        span = th - 4 - lo_m
+        base = float(np.nansum(v[GRID_PRE + lo_m:GRID_PRE + th - 4])) / (span / 5.0) if span >= 10 else np.nan
+        rvol = v5 / (base + 1.0) if np.isfinite(base) else 1.0
+        hi5, lo5 = h[GRID_PRE + th - 4:GRID_PRE + th + 1], l[GRID_PRE + th - 4:GRID_PRE + th + 1]
         rng5 = (np.nanmax(hi5) - np.nanmin(lo5)) / p if np.isfinite(hi5).any() else 0.0
         path = slice(GRID_PRE + tr, GRID_PRE + tr + LEN_PATH)
         has = np.isfinite(c[path])
@@ -627,7 +699,7 @@ def events_for_symbol_day(b, day, halts, args, tick_id, daykey):
             ret5=r5, ret15=r15, ret30=r30,
             dayret=p / day_open - 1 if np.isfinite(day_open) else 0.0,
             gap=day_open / prev_close - 1 if (np.isfinite(day_open) and np.isfinite(prev_close)) else 0.0,
-            dur=(hr.resume_ts - hr.halt_ts).total_seconds() / 60.0, nth=nth, rvol=v5 / (base + 1.0),
+            dur=(hr.resume_ts - hr.halt_ts).total_seconds() / 60.0, nth=nth, rvol=rvol,
             dvol5=math.log10(1.0 + v5 * p), rng5=rng5, dow=pd.Timestamp(day).weekday(),
             nb=max(1, min(LEN_PATH, 390 - tr)), tid=tick_id, P=P, has=has))
     return rows
@@ -636,9 +708,13 @@ def events_for_symbol_day(b, day, halts, args, tick_id, daykey):
 def build_halt_events(halts, args):
     cols = {k: [] for k in H_COLS}
     paths = {k: [] for k in PATH_COLS}
-    ticks, tid, dkeys = {}, 0, {}
+    ticks, tid, dkeys, missing = {}, 0, {}, 0
     for day, g in halts.groupby("day"):
-        bars = pd.read_pickle(bars_cache(day, args.dataset))
+        bf = bars_cache(day, args.dataset)
+        if not bf.exists():
+            missing += 1
+            continue
+        bars = pd.read_pickle(bf)
         for s, gg in g.groupby("sym"):
             b = bars.get(s)
             if b is None or len(b) < 10:
@@ -652,6 +728,8 @@ def build_halt_events(halts, args):
                 for k, a in zip(("PO", "PH", "PL", "PC"), r["P"]):
                     paths[k].append(a.astype(np.float32))
                 paths["has"].append(r["has"].astype(np.uint8))
+    if missing:
+        log(f"  ({missing} halt day(s) had no bars downloaded and are left out; run again to retry them)")
     if not cols["date"]:
         sys.exit("ERROR: no usable halt events were built (no bars around the halts?).")
     out = {k: np.array(v) for k, v in cols.items()}
@@ -1005,7 +1083,8 @@ def run_cfg(ev, c, args):
         side = side[:idx.size]
         return idx, side, cfg_sim(ev, c, idx, side, args)
     res = cfg_sim(ev, c, idx, side, args)
-    keep = seq_select(ev.daykey[idx], ev.emin[idx], res["ex_min"], c["maxday"])
+    o = np.lexsort((ev.emin[idx], ev.daykey[idx]))              # seq_select needs (stock-day, time) order, not market-wide time order
+    keep = np.sort(o[seq_select(ev.daykey[idx][o], ev.emin[idx][o], res["ex_min"][o], c["maxday"])])
     return idx[keep], side[keep], {k: v[keep] for k, v in res.items()}
 
 
@@ -2520,7 +2599,8 @@ def parse_args(argv=None):
     p.add_argument("--fee-share", type=float, default=0.004, help="fees, $ per share per side")
     p.add_argument("--min-price", type=float, default=0.5)
     p.add_argument("--max-price", type=float, default=200.0)
-    p.add_argument("--max-cost", type=float, default=10.0, help="most this run may spend on Databento, US dollars (cached data is free)")
+    p.add_argument("--max-cost", type=float, default=0.0, help="stop before spending more than this on Databento, US dollars (0 = no limit; cached data is free)")
+    p.add_argument("--yes", action="store_true", help="skip the 15-second 'this will cost about $X' pause")
     p.add_argument("--estimate", action="store_true", help="only print what the Databento downloads would cost, then exit")
     p.add_argument("--no-browser", action="store_true")
     p.add_argument("--selftest", choices=["null", "edge"], default=None)
@@ -2537,12 +2617,29 @@ def md5s(*parts):
     return hashlib.md5(repr(parts).encode()).hexdigest()[:12]
 
 
+def check_config(args):
+    """Refuse bad year settings BEFORE any download is paid for."""
+    lock_start = pd.Timestamp(args.end) - pd.DateOffset(months=args.lockbox_months)
+    last_sel_year = lock_start.year if (lock_start.month, lock_start.day) != (1, 1) else lock_start.year - 1
+    test_years = [y for y in range(args.first_year, last_sel_year + 1) if y >= args.first_test_year]
+    if not test_years or test_years[0] - args.first_year < 1:
+        have = (f"only {args.first_year} to {last_sel_year}" if args.first_year <= last_sel_year else "nothing at all")
+        sys.exit(f"ERROR: these year settings cannot work (nothing was downloaded or spent). The newest {args.lockbox_months} months "
+                 f"(from {lock_start:%Y-%m-%d}) are sealed, so the search and the neural net get {have}.\n"
+                 f"       The neural net needs at least 1 year of halts BEFORE its first test year ({args.first_test_year}). "
+                 f"Set FIRST_YEAR at least one year before FIRST_TEST_YEAR, and FIRST_TEST_YEAR no later than {last_sel_year}.")
+
+
 def prepare_events(args):
     keys = ("first_year", "end", "dataset", "lockbox_months", "min_price", "max_price", "selftest", "selftest_edge")
     ev_dir = Path("halt_events") / f"ev_{md5s(EV_VERSION, *[getattr(args, k) for k in keys])}"
     if (ev_dir / "meta.json").exists():
+        if args.estimate:
+            log("Everything is already downloaded and built, so there is nothing to estimate or spend.")
+            sys.exit(EXIT_INFO)
         log("[1/3] Halt events loaded from cache.")
         return json.loads((ev_dir / "meta.json").read_text()), ev_dir
+    check_config(args)
     log("[1/3] Finding LULD halts and building events (first run only - cached afterwards) ...")
     halts = load_halts(args)
     load_all_bars(halts, args)
@@ -2553,9 +2650,12 @@ def prepare_events(args):
         sys.exit("ERROR: the sealed lockbox or the selection set is empty - check FIRST_YEAR / END / LOCKBOX_MONTHS.")
     years = np.unique(d["date"][sel] // 10000)
     test_years = [int(y) for y in years if y >= args.first_test_year]
-    if not test_years or test_years[0] - int(years[0]) < 2:
-        sys.exit("ERROR: the neural net needs at least 2 years of halts before the first test year. "
+    if not test_years or test_years[0] - int(years[0]) < 1:
+        sys.exit("ERROR: the neural net needs at least 1 year of halts before the first test year. "
                  "Lower FIRST_YEAR or raise FIRST_TEST_YEAR.")
+    if test_years[0] - int(years[0]) < 2:
+        log(f"  (only {test_years[0] - int(years[0])} year of halts before the first test year: the neural net will be weaker; "
+            f"a lower FIRST_YEAR gives it more to learn from)")
     ev_dir.mkdir(parents=True, exist_ok=True)
     save_events(ev_dir, "sel", take_events(d, sel))
     save_events(ev_dir, "lock", take_events(d, ~sel))
