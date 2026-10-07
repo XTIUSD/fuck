@@ -44,7 +44,7 @@ REM prints roughly what that will cost on your Databento account and waits 15 se
 REM More years of history cost more (about the same per year): a later FIRST_YEAR / FIRST_TEST_YEAR is cheaper.
 REM To only see the estimate:   halt_hunter.bat --estimate
 REM MAX_COST: 0 = no limit. If you put a number here (US dollars) it refuses to start a download estimated above it.
-set "MAX_COST=0"
+set "MAX_COST=50"
 
 REM Trades are SHARES (not options), sized to BUDGET dollars. Halted stocks reopen with wide, jumpy prices, so every
 REM fill pays slippage: at least SLIP_BPS (hundredths of a percent of price), or SLIP_RNG x that minute's own

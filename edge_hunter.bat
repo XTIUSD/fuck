@@ -47,7 +47,7 @@ set "HALF_SPREAD=0.02"
 set "FEE=1.30"
 REM Costs are multiplied by this for the "still profitable if costs are higher?" test
 set "STRESS=1.5"
-set "MAX_COST=10"
+set "MAX_COST=50"
 REM ===========================================================
 
 REM Fully self-contained: uses (or downloads) its own portable Python in .\py
