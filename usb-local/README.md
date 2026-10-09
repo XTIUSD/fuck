@@ -8,19 +8,17 @@ Ctrl+Shift and left-drag a box. Click the popup or press Esc to close it. Ctrl+S
 
 - x.exe
 - start.bat
-- llama-server.exe and the DLLs from the same llama.cpp Windows build
+- llama-server.exe and the DLLs from a current llama.cpp Windows build
 - model.gguf
-- mmproj.gguf
+- mmproj.gguf, only if the build ships a separate projector
 
 ## Model
 
-Best free vision Qwen that fits on a 114 GB stick: Qwen2.5-VL-72B-Instruct at Q4_K_M, about 40 GB plus a projector file of about 1 GB. A 16-bit 72B does not fit. GitHub rejects files over 100 MB, so the weights are not in this repo.
+Use Qwen3.8-27B, the newer native vision Qwen. BF16 is about 55 GB, so it fits on a 114 GB stick with room for the runtime. That is higher quality than the older Qwen2.5-VL-72B Q4 file.
 
-Download once on a network, then copy the folder to the USB:
-
-- model: https://huggingface.co/mradermacher/Qwen2.5-VL-72B-Instruct-GGUF
-- use the Q4_K_M file and rename it model.gguf
-- mmproj: the matching mmproj file from that repo, renamed mmproj.gguf
+- https://huggingface.co/unsloth/Qwen3.8-27B-GGUF
+- download the BF16 file and rename it model.gguf
+- if that repo also has an mmproj file, rename it mmproj.gguf
 - llama.cpp Windows binaries: https://github.com/ggml-org/llama.cpp/releases
 
-If 72B is too slow on CPU, use Qwen2.5-VL-7B-Instruct Q4_K_M instead (about 5 GB). Same filenames.
+Use a llama.cpp build new enough to list qwen3.8 / qwen35. If BF16 is too slow, use Q8_0 from the same repo (about 29 GB) and keep the filename model.gguf.
